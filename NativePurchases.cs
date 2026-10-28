@@ -32,32 +32,38 @@ internal sealed class NativePurchases : IDisposable
     internal NativePurchases(BotBuyPatch owner)
     {
         this.owner = owner;
-        if (!OperatingSystem.IsWindows() || !Environment.Is64BitProcess)
-            throw new PlatformNotSupportedException("Native BotBuy currently requires Windows x64 gamedata.");
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64
+            || (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux()))
+            throw new PlatformNotSupportedException("Native BotBuy requires Windows or Linux x64 gamedata.");
         using var data = JsonDocument.Parse(File.ReadAllText(Path.Combine(owner.ModuleDirectory, "native-purchases.json")));
+        bool windows = OperatingSystem.IsWindows();
+        var profile = data.RootElement.GetProperty(windows ? "windows" : "linux");
+        string modulePath = windows ? "/csgo/bin/win64/server.dll" : "/csgo/bin/linuxsteamrt64/libserver.so";
         using var process = Process.GetCurrentProcess();
-        var module = process.Modules.Cast<ProcessModule>().Single(m => m.FileName.Replace('\\', '/').EndsWith("/csgo/bin/win64/server.dll", StringComparison.OrdinalIgnoreCase));
+        var module = process.Modules.Cast<ProcessModule>().Single(m => m.FileName.Replace('\\', '/').EndsWith(
+            modulePath, windows ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal));
         using var file = File.OpenRead(module.FileName);
-        if (Convert.ToHexString(SHA256.HashData(file)) != data.RootElement.GetProperty("sha256").GetString())
-            throw new InvalidOperationException("BotBuy gamedata does not match server.dll; update native-purchases.json.");
-        var functions = data.RootElement.GetProperty("functions");
+        if (!Convert.ToHexString(SHA256.HashData(file)).Equals(profile.GetProperty("sha256").GetString(), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"BotBuy gamedata does not match {module.ModuleName}; update native-purchases.json.");
+        var functions = profile.GetProperty("functions");
         (nint Address, string Signature) Resolve(string name)
         {
             var entry = functions.GetProperty(name);
             int rva = entry.GetProperty("rva").GetInt32();
             byte[] expected = Convert.FromHexString(entry.GetProperty("bytes").GetString()!);
-            if (rva <= 0 || rva > module.ModuleMemorySize - expected.Length)
-                throw new InvalidDataException($"BotBuy entry outside server.dll: {name}");
+            if (rva <= 0 || expected.Length < 16 || rva > module.ModuleMemorySize - expected.Length)
+                throw new InvalidDataException($"BotBuy entry outside {module.ModuleName}: {name}");
             string signature = string.Join(' ', expected.Select(b => b.ToString("X2")));
             nint address = module.BaseAddress + rva;
-            // CSS keeps its function and detour after Unhook. Only accept that
-            // exact cached binding on reload, with unchanged undisplaced bytes.
+            // A cached CSS function may retain its detour during reload. Only
+            // accept its audited jump span with unchanged undisplaced bytes.
             var cache = typeof(BaseMemoryFunction).GetField("_createdFunctions", BindingFlags.Static | BindingFlags.NonPublic)
                 ?.GetValue(null) as Dictionary<string, nint>;
             int skip = 0;
-            if (cache?.ContainsKey(signature) == true && Marshal.ReadByte(address) == 0xE9)
+            if (cache?.TryGetValue(signature, out nint cached) == true && cached != 0
+                && entry.TryGetProperty("hookBytes", out var hookBytes) && Marshal.ReadByte(address) == 0xE9)
             {
-                skip = entry.GetProperty("hookBytes").GetInt32();
+                skip = hookBytes.GetInt32();
                 if (skip < 5 || skip >= expected.Length) throw new InvalidDataException($"Invalid hook span: {name}");
                 for (int i = 5; i < skip; i++)
                     if (Marshal.ReadByte(address, i) != 0x90) throw new InvalidOperationException($"Unexpected detour padding: {name}");
